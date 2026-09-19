@@ -71,6 +71,45 @@ model temuProductListCache {
   @@map("temu_product_list_caches")
 }
 
+model temuProductListCacheStage {
+  id                       String   @id @default(uuid())
+  runId                    String
+  jobId                    String
+  userId                   String
+  shopId                   String
+  syncJobId                String?
+  productId                String
+  productSkcId             String
+  productName              String?  @db.Text
+  mainImageUrl             String?  @db.Text
+  extCode                  String?  @db.Text
+  createdAtTs              BigInt?
+  skcSiteStatus            Int?
+  bindSiteIds              Int[]    @default([])
+  bindSiteNames            String[] @default([])
+  isSupportPersonalization Boolean?
+  matchSkcJitMode          Boolean?
+  cat1Id                   Int?
+  cat2Id                   Int?
+  cat3Id                   Int?
+  cat4Id                   Int?
+  cat5Id                   Int?
+  cat6Id                   Int?
+  cat7Id                   Int?
+  cat8Id                   Int?
+  cat9Id                   Int?
+  cat10Id                  Int?
+  leafCatId                Int?
+  rawData                  Json
+  syncedAt                 DateTime @default(now())
+  createdAt                DateTime @default(now())
+
+  @@unique([runId, productSkcId])
+  @@index([jobId], map: "temu_product_list_cache_stages_job_idx")
+  @@index([shopId, createdAt], map: "temu_product_list_cache_stages_shop_created_idx")
+  @@map("temu_product_list_cache_stages")
+}
+
 model temuProductLifecycleStatusCache {
   id                  String   @id @default(uuid())
   shopId              String
@@ -96,6 +135,7 @@ model temuProductListSyncJob {
   shopId       String
   status       String
   triggerType  String
+  activeRunId  String?
   totalCount   Int       @default(0)
   syncedCount  Int       @default(0)
   pageSize     Int       @default(100)
