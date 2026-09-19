@@ -9,7 +9,10 @@ import { AccountOwnerService } from '../subscription/account-owner.service';
 import { SubscriptionCheckService } from '../subscription/subscription-check.service';
 import { SubscriptionEntitlementService } from '../subscription/subscription-entitlement.service';
 import { TemuService } from './temu.service';
-import { withProductListRateLimitRetry } from './product-list-rate-limit-retry';
+import {
+  isProductListRateLimitWaitInterruptedError,
+  withProductListRateLimitRetry,
+} from './product-list-rate-limit-retry';
 import { mapSelectStatusToSaleLifecycleStatus } from './product-lifecycle-status';
 
 export const PRODUCT_LIST_CACHE_REFRESH_QUEUE_NAME = 'product-list-cache-refresh-queue';
@@ -24,6 +27,8 @@ const RUNNING_REFRESH_STATUSES = ['PENDING', 'PROCESSING'];
 const CANCELLED_REFRESH_STATUS = 'CANCELLED';
 const TERMINAL_QUEUE_STATES = new Set(['completed', 'failed']);
 const REFRESH_QUEUE_JOB_ID_PREFIX = 'product-list-cache-refresh';
+const REFRESH_STAGING_RETENTION_MS = 6 * 60 * 60 * 1000;
+const REFRESH_WAIT_INTERRUPT_CHECK_INTERVAL_MS = 100;
 
 export type ProductListCacheRefreshTrigger = 'MANUAL' | 'MANUAL_INCREMENTAL' | 'AUTO_EMPTY' | 'SCHEDULED';
 
@@ -68,6 +73,15 @@ type ProductListRefreshScope = {
   createdAtStart?: number;
   knownProductSkcIds: Set<string>;
 };
+
+type RefreshExecutionState = 'active' | 'cancelled' | 'superseded' | 'terminal';
+
+class RefreshExecutionInvalidatedError extends Error {
+  constructor() {
+    super('商品缓存刷新执行已失效');
+    this.name = 'RefreshExecutionInvalidatedError';
+  }
+}
 
 export type ProductLifecycleStatusCacheRefreshResult = {
   success: true;
@@ -296,6 +310,10 @@ export class ProductListCacheRefreshService {
       return this.serializeJob(latestJob);
     }
 
+    await (this.prisma as any).temuProductListCacheStaging.deleteMany({
+      where: { syncJobId: runningJob.id },
+    }).catch(() => undefined);
+
     return this.serializeJob({
       ...runningJob,
       status: CANCELLED_REFRESH_STATUS,
@@ -336,14 +354,24 @@ export class ProductListCacheRefreshService {
       return { success: true, skipped: true };
     }
     if (job.status === CANCELLED_REFRESH_STATUS) {
-      await this.markRefreshJobCancelledProgress(data.jobId, job.totalCount || 0, job.syncedCount || 0, job.currentPage || 0);
       return { success: true, cancelled: true, totalCount: job.totalCount || 0, syncedCount: job.syncedCount || 0 };
     }
     if (!RUNNING_REFRESH_STATUSES.includes(job.status)) {
       return { success: true, skipped: true };
     }
 
+    // 登记本次执行：同一任务以后登记开始的执行为准，旧执行的所有写入都会被拒绝。
     const startedAt = new Date();
+    const executionEpoch = await this.registerRefreshExecution(data.jobId, startedAt);
+    if (executionEpoch === null) {
+      return { success: true, skipped: true };
+    }
+    await this.reclaimStaleRefreshStaging(data.shopId, data.jobId, executionEpoch).catch((error: any) => {
+      this.logger.warn(
+        `[商品列表缓存] 回收失效暂存数据失败 shopId=${data.shopId} jobId=${data.jobId}: ${this.getErrorMessage(error)}`,
+      );
+    });
+
     const pageSize = Number(job.pageSize || PRODUCT_LIST_CACHE_REFRESH_PAGE_SIZE);
     let totalCount = 0;
     let syncedCount = 0;
@@ -353,30 +381,28 @@ export class ProductListCacheRefreshService {
     let createdAtEnd: number | undefined;
     let lastFetchedCreatedAt: number | undefined;
     let refreshScope: ProductListRefreshScope = { mode: 'FULL', knownProductSkcIds: new Set<string>() };
+    const roundProducts: any[] = [];
+    let accessToken: string | null = null;
+
+    const finishInactive = async (state: RefreshExecutionState) => this.finishInactiveRefreshExecution(
+      state,
+      data.jobId,
+      executionEpoch,
+      totalCount,
+      syncedCount,
+      currentPage,
+    );
 
     try {
-      const token = await this.getAccessibleShopToken(data.userId, data.shopId);
+      accessToken = await this.getAccessibleShopToken(data.userId, data.shopId);
       refreshScope = await this.resolveProductListRefreshScope(data.shopId, job.triggerType);
       createdAtStart = refreshScope.createdAtStart;
       const syncedProductSkcIds = new Set(refreshScope.knownProductSkcIds);
-      const startedJob = await this.updateRefreshJobIfNotCancelled(data.jobId, {
-        status: 'PROCESSING',
-        startedAt,
-        finishedAt: null,
-        errorMessage: null,
-        totalCount: 0,
-        syncedCount: 0,
-        currentPage: 0,
-      });
-      if (!startedJob) {
-        await this.markRefreshJobCancelledProgress(data.jobId, totalCount, syncedCount, currentPage);
-        return { success: true, cancelled: true, totalCount, syncedCount };
-      }
 
       while (true) {
-        if (await this.isRefreshJobCancelled(data.jobId)) {
-          await this.markRefreshJobCancelledProgress(data.jobId, totalCount, syncedCount, currentPage);
-          return { success: true, cancelled: true, totalCount, syncedCount };
+        const executionState = await this.getRefreshExecutionState(data.jobId, executionEpoch);
+        if (executionState !== 'active') {
+          return finishInactive(executionState);
         }
 
         let response: any;
@@ -385,14 +411,20 @@ export class ProductListCacheRefreshService {
         if (createdAtEnd !== undefined) requestFilters.createdAtEnd = createdAtEnd;
         try {
           response = await withProductListRateLimitRetry(
-            () => this.temuService.getProducts(token, requestFilters),
+            () => this.temuService.getProducts(accessToken as string, requestFilters),
             {
               logger: this.logger,
               context: `shopId=${data.shopId} page=${requestPage}`,
+              shouldInterrupt: () => this.isRefreshExecutionInactive(data.jobId, executionEpoch),
+              interruptCheckIntervalMs: REFRESH_WAIT_INTERRUPT_CHECK_INTERVAL_MS,
             },
           );
         } catch (error: any) {
-          if (this.isProductListDeepPaginationError(error) && lastFetchedCreatedAt !== undefined) {
+          if (
+            !isProductListRateLimitWaitInterruptedError(error)
+            && this.isProductListDeepPaginationError(error)
+            && lastFetchedCreatedAt !== undefined
+          ) {
             if (createdAtEnd !== undefined && lastFetchedCreatedAt >= createdAtEnd) {
               throw error;
             }
@@ -405,89 +437,91 @@ export class ProductListCacheRefreshService {
           }
           throw error;
         }
-        const products = this.getProductListData(response);
-        const responseTotalCount = this.getProductListTotalCount(response);
-        totalCount = Math.max(totalCount, responseTotalCount, syncedCount);
-        if (products.length === 0) break;
-        lastFetchedCreatedAt = this.getProductCreatedAtBoundary(products);
-        const uniqueProducts = products.filter((product: any) => {
+        const parsedPage = this.parseProductListResponse(response);
+        const fetchedProducts = parsedPage.products;
+        totalCount = Math.max(totalCount, parsedPage.totalCount, syncedCount);
+        if (fetchedProducts.length === 0) break;
+        lastFetchedCreatedAt = this.getProductCreatedAtBoundary(fetchedProducts);
+        const uniqueProducts = fetchedProducts.filter((product: any) => {
           const productSkcId = this.getProductSkcId(product);
-          if (!productSkcId) return true;
           if (syncedProductSkcIds.has(productSkcId)) return false;
           syncedProductSkcIds.add(productSkcId);
           return true;
         });
-        totalCount = Math.max(totalCount, responseTotalCount, syncedCount + uniqueProducts.length);
+        totalCount = Math.max(totalCount, parsedPage.totalCount, syncedCount + uniqueProducts.length);
 
         if (uniqueProducts.length > 0) {
-          await this.upsertProductsToCache(data.userId, data.shopId, uniqueProducts, {
-            syncedAt: startedAt,
-            syncJobId: data.jobId,
-            source: 'BACKGROUND_REFRESH',
-          });
-          await this.upsertProductLifecycleStatusesToCache(token, data.shopId, uniqueProducts, startedAt).catch((error) => {
-            this.logger.warn(
-              `[商品生命周期缓存] 写入失败 shopId=${data.shopId} jobId=${data.jobId}: ${this.getErrorMessage(error)}`,
-            );
-          });
+          await this.stageProductsForExecution(
+            data.userId,
+            data.shopId,
+            data.jobId,
+            executionEpoch,
+            uniqueProducts,
+            startedAt,
+          );
+          roundProducts.push(...uniqueProducts);
         }
 
         syncedCount += uniqueProducts.length;
         currentPage += 1;
-        const progressJob = await this.updateRefreshJobIfNotCancelled(data.jobId, {
+        const progressed = await this.updateRefreshExecution(data.jobId, executionEpoch, {
           status: 'PROCESSING',
           totalCount,
           syncedCount,
           currentPage,
         });
 
-        if (!progressJob || await this.isRefreshJobCancelled(data.jobId)) {
-          await this.markRefreshJobCancelledProgress(data.jobId, totalCount, syncedCount, currentPage);
-          return { success: true, cancelled: true, totalCount, syncedCount };
+        if (!progressed) {
+          return finishInactive(await this.getRefreshExecutionState(data.jobId, executionEpoch));
         }
 
         if (totalCount <= syncedCount) break;
         requestPage += 1;
       }
 
-      if (await this.isRefreshJobCancelled(data.jobId)) {
-        await this.markRefreshJobCancelledProgress(data.jobId, totalCount, syncedCount, currentPage);
-        return { success: true, cancelled: true, totalCount, syncedCount };
-      }
-
-      if (refreshScope.mode === 'FULL') {
-        await (this.prisma as any).temuProductListCache.updateMany({
-          where: {
-            shopId: data.shopId,
-            isActive: true,
-            OR: [{ syncJobId: null }, { syncJobId: { not: data.jobId } }],
-          },
-          data: { isActive: false },
-        });
+      const preCommitState = await this.getRefreshExecutionState(data.jobId, executionEpoch);
+      if (preCommitState !== 'active') {
+        return finishInactive(preCommitState);
       }
 
       const completedTotalCount = refreshScope.mode === 'INCREMENTAL' ? syncedCount : totalCount;
-      const completedJob = await this.updateRefreshJobIfNotCancelled(data.jobId, {
-        status: 'COMPLETED',
+      const commitOutcome = await this.commitRefreshExecution({
+        jobId: data.jobId,
+        shopId: data.shopId,
+        executionEpoch,
+        mode: refreshScope.mode,
+        startedAt,
         totalCount: completedTotalCount,
         syncedCount,
         currentPage,
-        finishedAt: new Date(),
-        errorMessage: null,
       });
-      if (!completedJob && await this.isRefreshJobCancelled(data.jobId)) {
-        await this.markRefreshJobCancelledProgress(data.jobId, totalCount, syncedCount, currentPage);
-        return { success: true, cancelled: true, totalCount, syncedCount };
+      if (commitOutcome !== 'committed') {
+        return finishInactive(commitOutcome);
+      }
+
+      // 生命周期每轮整体更新（含手动刷新）；查询失败保留旧值，不妨碍已发布的商品列表。
+      if (accessToken) {
+        await this.refreshLifecycleStatusesForRound(
+          accessToken,
+          data.shopId,
+          data.jobId,
+          executionEpoch,
+          roundProducts,
+        ).catch((error: any) => {
+          this.logger.warn(
+            `[商品生命周期缓存] 写入失败 shopId=${data.shopId} jobId=${data.jobId}: ${this.getErrorMessage(error)}`,
+          );
+        });
       }
 
       return { success: true, totalCount: completedTotalCount, syncedCount };
     } catch (error: any) {
       const message = this.getErrorMessage(error);
-      if (await this.isRefreshJobCancelled(data.jobId)) {
-        await this.markRefreshJobCancelledProgress(data.jobId, totalCount, syncedCount, currentPage);
-        return { success: true, cancelled: true, totalCount, syncedCount };
+      const executionState = await this.getRefreshExecutionState(data.jobId, executionEpoch).catch(() => 'active' as RefreshExecutionState);
+      if (executionState !== 'active') {
+        return finishInactive(executionState);
       }
-      await this.updateRefreshJobIfNotCancelled(data.jobId, {
+      await this.updateRefreshExecution(data.jobId, executionEpoch, {
         status: 'FAILED',
         totalCount,
         syncedCount,
@@ -495,6 +529,7 @@ export class ProductListCacheRefreshService {
         errorMessage: message,
         finishedAt: new Date(),
       });
+      await this.cleanupRefreshStaging(data.jobId, executionEpoch);
       this.logger.warn(`[商品列表缓存] 后台同步失败 shopId=${data.shopId} jobId=${data.jobId}: ${message}`);
       throw error;
     }
@@ -581,7 +616,8 @@ export class ProductListCacheRefreshService {
     const syncedAt = options.syncedAt || new Date();
     const rows = products
       .map((product) => this.buildProductCachePayload(userId, shopId, product, syncedAt, options.syncJobId ?? null))
-      .filter(Boolean) as any[];
+      .filter(Boolean)
+      .map((row: any) => ({ ...row, isActive: true })) as any[];
     if (rows.length === 0) return;
 
     for (const chunk of this.chunkArray(rows, PRODUCT_LIST_CACHE_UPSERT_BATCH_SIZE)) {
@@ -667,7 +703,6 @@ export class ProductListCacheRefreshService {
       leafCatId: this.toOptionalInteger(product?.categories?.leafCat?.catId ?? product?.leafCat?.catId),
       rawData: product,
       syncedAt,
-      isActive: true,
     };
   }
 
@@ -690,16 +725,6 @@ export class ProductListCacheRefreshService {
     });
 
     return { siteIds, siteNames };
-  }
-
-  private async upsertProductLifecycleStatusesToCache(
-    accessToken: string,
-    shopId: string,
-    products: any[],
-    syncedAt: Date,
-  ) {
-    const productSkuIds = this.getProductSkuIds(products);
-    return this.upsertProductLifecycleStatusesBySkuIdsToCache(accessToken, shopId, productSkuIds, syncedAt);
   }
 
   private async upsertProductLifecycleStatusesBySkuIdsToCache(
@@ -848,19 +873,31 @@ export class ProductListCacheRefreshService {
     return user?.createdBy || null;
   }
 
-  private getProductListResult(response: any) {
-    return response?.result || response || {};
+  private parseProductListResponse(response: any): { products: any[]; totalCount: number } {
+    if (!response || typeof response !== 'object' || response.success === false) {
+      throw new Error('商品列表响应不完整：缺少有效的响应结果');
+    }
+    const result = response.result && typeof response.result === 'object' ? response.result : response;
+    if (!Array.isArray(result.data)) {
+      throw new Error('商品列表响应不完整：缺少商品数据列表');
+    }
+    const declaredTotalCount = Number(result.totalCount);
+    if (!Number.isFinite(declaredTotalCount) || declaredTotalCount < 0) {
+      throw new Error('商品列表响应不完整：声明总数无效');
+    }
+    const products = result.data;
+    for (const product of products) {
+      if (!this.getProductSkcId(product) || !this.getProductId(product)) {
+        throw new Error('商品列表响应不完整：商品标识无效');
+      }
+    }
+    return { products, totalCount: Math.trunc(declaredTotalCount) };
   }
 
-  private getProductListData(response: any) {
-    const result = this.getProductListResult(response);
-    return Array.isArray(result?.data) ? result.data : [];
-  }
-
-  private getProductListTotalCount(response: any) {
-    const result = this.getProductListResult(response);
-    const total = Number(result?.totalCount);
-    return Number.isFinite(total) && total >= 0 ? Math.trunc(total) : this.getProductListData(response).length;
+  private getProductId(product: any) {
+    const value = product?.productId;
+    if (value === undefined || value === null || value === '') return null;
+    return String(value);
   }
 
   private isProductListDeepPaginationError(error: any) {
@@ -961,36 +998,255 @@ export class ProductListCacheRefreshService {
         finishedAt: new Date(),
       },
     });
+    await (this.prisma as any).temuProductListCacheStaging.deleteMany({
+      where: { syncJobId: jobId },
+    }).catch(() => undefined);
   }
 
-  private async isRefreshJobCancelled(jobId: string) {
+  private async registerRefreshExecution(jobId: string, startedAt: Date): Promise<number | null> {
+    const rows = await (this.prisma as any).$queryRaw`
+      UPDATE "temu_product_list_sync_jobs"
+      SET "executionEpoch" = "executionEpoch" + 1,
+          "status" = 'PROCESSING',
+          "startedAt" = ${startedAt},
+          "finishedAt" = NULL,
+          "errorMessage" = NULL,
+          "totalCount" = 0,
+          "syncedCount" = 0,
+          "currentPage" = 0,
+          "updatedAt" = NOW()
+      WHERE "id" = ${jobId} AND "status" IN ('PENDING', 'PROCESSING')
+      RETURNING "executionEpoch"
+    `;
+    const executionEpoch = Number(rows?.[0]?.executionEpoch);
+    return Number.isFinite(executionEpoch) && rows.length > 0 ? executionEpoch : null;
+  }
+
+  private async getRefreshExecutionState(jobId: string, executionEpoch: number): Promise<RefreshExecutionState> {
     const job = await (this.prisma as any).temuProductListSyncJob.findUnique({
       where: { id: jobId },
-      select: { status: true },
+      select: { status: true, executionEpoch: true },
     });
-    return job?.status === CANCELLED_REFRESH_STATUS;
+    if (!job) return 'terminal';
+    if (job.status === CANCELLED_REFRESH_STATUS) return 'cancelled';
+    if (Number(job.executionEpoch) !== executionEpoch) return 'superseded';
+    if (!RUNNING_REFRESH_STATUSES.includes(job.status)) return 'terminal';
+    return 'active';
   }
 
-  private async updateRefreshJobIfNotCancelled(jobId: string, data: Record<string, any>) {
+  private async isRefreshExecutionInactive(jobId: string, executionEpoch: number) {
+    return (await this.getRefreshExecutionState(jobId, executionEpoch)) !== 'active';
+  }
+
+  private async updateRefreshExecution(jobId: string, executionEpoch: number, data: Record<string, any>) {
+    const result = await (this.prisma as any).temuProductListSyncJob.updateMany({
+      where: {
+        id: jobId,
+        executionEpoch,
+        status: { in: RUNNING_REFRESH_STATUSES },
+      },
+      data,
+    });
+    return Number(result?.count || 0) > 0;
+  }
+
+  private async finishInactiveRefreshExecution(
+    state: RefreshExecutionState,
+    jobId: string,
+    executionEpoch: number,
+    totalCount: number,
+    syncedCount: number,
+    currentPage: number,
+  ) {
+    if (state === 'cancelled') {
+      await this.markRefreshJobCancelledProgress(jobId, executionEpoch, totalCount, syncedCount, currentPage);
+      await this.cleanupRefreshStaging(jobId, executionEpoch);
+      return { success: true, cancelled: true, totalCount, syncedCount };
+    }
+    await this.cleanupRefreshStaging(jobId, executionEpoch);
+    return { success: true, skipped: true, superseded: true };
+  }
+
+  private async stageProductsForExecution(
+    userId: string,
+    shopId: string,
+    jobId: string,
+    executionEpoch: number,
+    products: any[],
+    syncedAt: Date,
+  ) {
+    const rows = products
+      .map((product) => this.buildProductCachePayload(userId, shopId, product, syncedAt, jobId))
+      .filter(Boolean) as any[];
+    if (rows.length === 0) return;
+
+    for (const chunk of this.chunkArray(rows, PRODUCT_LIST_CACHE_UPSERT_BATCH_SIZE)) {
+      await Promise.all(chunk.map((row) => (this.prisma as any).temuProductListCacheStaging.upsert({
+        where: {
+          syncJobId_executionEpoch_productSkcId: {
+            syncJobId: jobId,
+            executionEpoch,
+            productSkcId: row.productSkcId,
+          },
+        },
+        create: { ...row, executionEpoch },
+        update: { ...row, executionEpoch },
+      })));
+    }
+  }
+
+  private async commitRefreshExecution(params: {
+    jobId: string;
+    shopId: string;
+    executionEpoch: number;
+    mode: ProductListRefreshMode;
+    startedAt: Date;
+    totalCount: number;
+    syncedCount: number;
+    currentPage: number;
+  }): Promise<'committed' | 'cancelled' | 'superseded'> {
+    const { jobId, shopId, executionEpoch, mode, startedAt, totalCount, syncedCount, currentPage } = params;
     try {
-      return await (this.prisma as any).temuProductListSyncJob.update({
-        where: { id: jobId, status: { not: CANCELLED_REFRESH_STATUS } },
-        data,
-      });
+      await (this.prisma as any).$transaction(async (tx: any) => {
+        const stagedRows = await tx.temuProductListCacheStaging.findMany({
+          where: { syncJobId: jobId, executionEpoch },
+          orderBy: { createdAt: 'asc' },
+        });
+        const stagedSkcIds = stagedRows.map((row: any) => row.productSkcId);
+        const existingRows = stagedSkcIds.length > 0
+          ? await tx.temuProductListCache.findMany({
+            where: { shopId, productSkcId: { in: stagedSkcIds } },
+            select: { productSkcId: true, syncedAt: true },
+          })
+          : [];
+        const existingSyncedAtBySkcId = new Map<string, Date>(
+          existingRows.map((row: any) => [row.productSkcId, row.syncedAt as Date]),
+        );
+
+        const rowsToCreate: any[] = [];
+        for (const stagedRow of stagedRows) {
+          const { id, executionEpoch: _stagedEpoch, createdAt, updatedAt, ...payload } = stagedRow;
+          const cacheRow = { ...payload, isActive: true };
+          const existingSyncedAt = existingSyncedAtBySkcId.get(stagedRow.productSkcId);
+          if (!existingSyncedAt) {
+            rowsToCreate.push(cacheRow);
+            continue;
+          }
+          // 刷新开始后接收的实时数据优先：只覆盖不晚于本轮开始时间的旧数据。
+          if (existingSyncedAt.getTime() <= startedAt.getTime()) {
+            await tx.temuProductListCache.updateMany({
+              where: {
+                shopId,
+                productSkcId: stagedRow.productSkcId,
+                syncedAt: { lte: startedAt },
+              },
+              data: cacheRow,
+            });
+          }
+        }
+        for (const chunk of this.chunkArray(rowsToCreate, PRODUCT_LIST_CACHE_UPSERT_BATCH_SIZE)) {
+          await tx.temuProductListCache.createMany({ data: chunk, skipDuplicates: true });
+        }
+
+        if (mode === 'FULL') {
+          await tx.temuProductListCache.updateMany({
+            where: { shopId, isActive: true, syncedAt: { lt: startedAt } },
+            data: { isActive: false },
+          });
+        }
+
+        const completed = await tx.temuProductListSyncJob.updateMany({
+          where: {
+            id: jobId,
+            executionEpoch,
+            status: { in: RUNNING_REFRESH_STATUSES },
+          },
+          data: {
+            status: 'COMPLETED',
+            totalCount,
+            syncedCount,
+            currentPage,
+            finishedAt: new Date(),
+            errorMessage: null,
+          },
+        });
+        if (Number(completed?.count || 0) === 0) {
+          throw new RefreshExecutionInvalidatedError();
+        }
+
+        await tx.temuProductListCacheStaging.deleteMany({
+          where: { syncJobId: jobId, executionEpoch },
+        });
+      }, { maxWait: 10000, timeout: 60000 });
     } catch (error: any) {
-      if (error?.code === 'P2025') return null;
+      if (error instanceof RefreshExecutionInvalidatedError || error?.name === 'RefreshExecutionInvalidatedError') {
+        const state = await this.getRefreshExecutionState(jobId, executionEpoch);
+        return state === 'cancelled' ? 'cancelled' : 'superseded';
+      }
       throw error;
     }
+    return 'committed';
+  }
+
+  private async reclaimStaleRefreshStaging(shopId: string, activeJobId: string, activeExecutionEpoch: number) {
+    const terminalJobs = await (this.prisma as any).temuProductListSyncJob.findMany({
+      where: { shopId, status: { notIn: RUNNING_REFRESH_STATUSES } },
+      select: { id: true },
+    });
+    const terminalJobIds = terminalJobs.map((job: any) => job.id);
+    const staleBefore = new Date(Date.now() - REFRESH_STAGING_RETENTION_MS);
+    await (this.prisma as any).temuProductListCacheStaging.deleteMany({
+      where: {
+        shopId,
+        NOT: { syncJobId: activeJobId, executionEpoch: activeExecutionEpoch },
+        OR: [
+          { syncJobId: activeJobId },
+          ...(terminalJobIds.length > 0 ? [{ syncJobId: { in: terminalJobIds } }] : []),
+          { createdAt: { lt: staleBefore } },
+        ],
+      },
+    });
+  }
+
+  private async cleanupRefreshStaging(jobId: string, executionEpoch: number) {
+    await (this.prisma as any).temuProductListCacheStaging.deleteMany({
+      where: { syncJobId: jobId, executionEpoch },
+    }).catch((error: any) => {
+      this.logger.warn(
+        `[商品列表缓存] 清理暂存数据失败 jobId=${jobId} epoch=${executionEpoch}: ${this.getErrorMessage(error)}`,
+      );
+    });
+  }
+
+  private async refreshLifecycleStatusesForRound(
+    accessToken: string,
+    shopId: string,
+    jobId: string,
+    executionEpoch: number,
+    products: any[],
+  ) {
+    const productSkuIds = this.getProductSkuIds(products);
+    if (productSkuIds.length === 0) return;
+
+    const job = await (this.prisma as any).temuProductListSyncJob.findUnique({
+      where: { id: jobId },
+      select: { status: true, executionEpoch: true },
+    });
+    if (!job || Number(job.executionEpoch) !== executionEpoch || job.status !== 'COMPLETED') {
+      return;
+    }
+    await this.upsertProductLifecycleStatusesBySkuIdsToCache(accessToken, shopId, productSkuIds, new Date());
   }
 
   private async markRefreshJobCancelledProgress(
     jobId: string,
+    executionEpoch: number,
     totalCount: number,
     syncedCount: number,
     currentPage: number,
   ) {
     await (this.prisma as any).temuProductListSyncJob.updateMany({
-      where: { id: jobId, status: CANCELLED_REFRESH_STATUS },
+      where: { id: jobId, executionEpoch, status: CANCELLED_REFRESH_STATUS },
       data: {
         totalCount,
         syncedCount,

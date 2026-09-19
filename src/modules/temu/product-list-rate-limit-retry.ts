@@ -4,6 +4,23 @@ export const PRODUCT_LIST_RATE_LIMIT_RETRY_MIN_DELAY_MS = 1000;
 export const PRODUCT_LIST_RATE_LIMIT_RETRY_MAX_DELAY_MS = 30000;
 export const PRODUCT_LIST_RATE_LIMIT_MAX_RETRIES = 6;
 export const TEMU_RATE_LIMIT_RETRY_EXHAUSTED_MESSAGE = '平台接口繁忙，后台已自动等待重试但仍未恢复，请稍后刷新或重新触发';
+export const PRODUCT_LIST_RATE_LIMIT_WAIT_INTERRUPTED_MESSAGE = '商品列表限流等待期间任务已取消或被替换';
+
+const DEFAULT_INTERRUPT_CHECK_INTERVAL_MS = 100;
+
+export class ProductListRateLimitWaitInterruptedError extends Error {
+  constructor(message: string = PRODUCT_LIST_RATE_LIMIT_WAIT_INTERRUPTED_MESSAGE) {
+    super(message);
+    this.name = 'ProductListRateLimitWaitInterruptedError';
+  }
+}
+
+export function isProductListRateLimitWaitInterruptedError(error: unknown) {
+  return (
+    error instanceof ProductListRateLimitWaitInterruptedError
+    || (error as any)?.name === 'ProductListRateLimitWaitInterruptedError'
+  );
+}
 
 type ProductListRateLimitRetryLogger = {
   warn?: (message: string) => void;
@@ -16,6 +33,8 @@ type ProductListRateLimitRetryOptions = {
   sleep?: (delayMs: number) => Promise<void>;
   logger?: ProductListRateLimitRetryLogger;
   context?: string;
+  shouldInterrupt?: () => boolean | Promise<boolean>;
+  interruptCheckIntervalMs?: number;
 };
 
 const RATE_LIMIT_KEYWORDS = [
@@ -91,6 +110,27 @@ function createRateLimitRetryExhaustedException() {
   });
 }
 
+async function sleepWithInterruptCheck(
+  delayMs: number,
+  sleep: (delayMs: number) => Promise<void>,
+  shouldInterrupt: () => boolean | Promise<boolean>,
+  interruptCheckIntervalMs: number,
+) {
+  const intervalMs = Math.max(1, Math.floor(interruptCheckIntervalMs));
+  let remainingMs = Math.max(0, Math.floor(delayMs));
+  while (remainingMs > 0) {
+    if (await shouldInterrupt()) {
+      throw new ProductListRateLimitWaitInterruptedError();
+    }
+    const sliceMs = Math.min(remainingMs, intervalMs);
+    await sleep(sliceMs);
+    remainingMs -= sliceMs;
+  }
+  if (await shouldInterrupt()) {
+    throw new ProductListRateLimitWaitInterruptedError();
+  }
+}
+
 export async function withProductListRateLimitRetry<T>(
   operation: () => Promise<T>,
   options: ProductListRateLimitRetryOptions = {},
@@ -101,6 +141,10 @@ export async function withProductListRateLimitRetry<T>(
   const sleep = options.sleep ?? defaultSleep;
 
   for (let retryCount = 0; ; retryCount += 1) {
+    if (options.shouldInterrupt && await options.shouldInterrupt()) {
+      throw new ProductListRateLimitWaitInterruptedError();
+    }
+
     try {
       return await operation();
     } catch (error) {
@@ -119,7 +163,16 @@ export async function withProductListRateLimitRetry<T>(
       options.logger?.warn?.(
         `[商品列表] TEMU 限流，第 ${retryCount + 1}/${maxRetries} 次重试将在 ${delayMs}ms 后执行${options.context ? ` (${options.context})` : ''}`,
       );
-      await sleep(delayMs);
+      if (options.shouldInterrupt) {
+        await sleepWithInterruptCheck(
+          delayMs,
+          sleep,
+          options.shouldInterrupt,
+          options.interruptCheckIntervalMs ?? DEFAULT_INTERRUPT_CHECK_INTERVAL_MS,
+        );
+      } else {
+        await sleep(delayMs);
+      }
     }
   }
 }

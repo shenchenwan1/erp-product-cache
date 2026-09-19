@@ -91,22 +91,61 @@ model temuProductLifecycleStatusCache {
 }
 
 model temuProductListSyncJob {
-  id           String    @id @default(uuid())
-  userId       String
-  shopId       String
-  status       String
-  triggerType  String
-  totalCount   Int       @default(0)
-  syncedCount  Int       @default(0)
-  pageSize     Int       @default(100)
-  currentPage  Int       @default(0)
-  errorMessage String?   @db.Text
-  startedAt    DateTime?
-  finishedAt   DateTime?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  id             String    @id @default(uuid())
+  userId         String
+  shopId         String
+  status         String
+  triggerType    String
+  executionEpoch Int       @default(0)
+  totalCount     Int       @default(0)
+  syncedCount    Int       @default(0)
+  pageSize       Int       @default(100)
+  currentPage    Int       @default(0)
+  errorMessage   String?   @db.Text
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   @@index([shopId, status, createdAt], map: "temu_product_list_sync_jobs_shop_status_created_idx")
   @@index([userId, shopId, createdAt], map: "temu_product_list_sync_jobs_user_shop_created_idx")
   @@map("temu_product_list_sync_jobs")
+}
+
+model temuProductListCacheStaging {
+  id                       String   @id @default(uuid())
+  userId                   String
+  shopId                   String
+  syncJobId                String
+  executionEpoch           Int
+  productId                String
+  productSkcId             String
+  productName              String?  @db.Text
+  mainImageUrl             String?  @db.Text
+  extCode                  String?  @db.Text
+  createdAtTs              BigInt?
+  skcSiteStatus            Int?
+  bindSiteIds              Int[]    @default([])
+  bindSiteNames            String[] @default([])
+  isSupportPersonalization Boolean?
+  matchSkcJitMode          Boolean?
+  cat1Id                   Int?
+  cat2Id                   Int?
+  cat3Id                   Int?
+  cat4Id                   Int?
+  cat5Id                   Int?
+  cat6Id                   Int?
+  cat7Id                   Int?
+  cat8Id                   Int?
+  cat9Id                   Int?
+  cat10Id                  Int?
+  leafCatId                Int?
+  rawData                  Json
+  syncedAt                 DateTime
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@unique([syncJobId, executionEpoch, productSkcId])
+  @@index([shopId, syncJobId, executionEpoch], map: "temu_product_list_cache_staging_shop_run_idx")
+  @@map("temu_product_list_cache_staging")
 }
