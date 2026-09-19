@@ -1,0 +1,112 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+model user {
+  id String @id
+  createdBy String?
+  @@map("users")
+}
+model shop {
+  id String @id
+  userId String
+  createdByUserId String?
+  status String @default("ACTIVE")
+  accessToken String?
+  authorizations shopAuthorization[]
+  @@map("shops")
+}
+model shopAuthorization {
+  id String @id @default(uuid())
+  shopId String
+  userId String
+  shop shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  @@unique([shopId,userId])
+  @@map("shop_authorizations")
+}
+model temuProductListCache {
+  id                       String   @id @default(uuid())
+  userId                   String
+  shopId                   String
+  syncJobId                String?
+  productId                String
+  productSkcId             String
+  productName              String?  @db.Text
+  mainImageUrl             String?  @db.Text
+  extCode                  String?  @db.Text
+  createdAtTs              BigInt?
+  skcSiteStatus            Int?
+  bindSiteIds              Int[]    @default([])
+  bindSiteNames            String[] @default([])
+  isSupportPersonalization Boolean?
+  matchSkcJitMode          Boolean?
+  cat1Id                   Int?
+  cat2Id                   Int?
+  cat3Id                   Int?
+  cat4Id                   Int?
+  cat5Id                   Int?
+  cat6Id                   Int?
+  cat7Id                   Int?
+  cat8Id                   Int?
+  cat9Id                   Int?
+  cat10Id                  Int?
+  leafCatId                Int?
+  rawData                  Json
+  syncedAt                 DateTime @default(now())
+  isActive                 Boolean  @default(true)
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@unique([shopId, productSkcId])
+  @@index([userId, shopId, isActive, createdAtTs], map: "temu_product_list_caches_user_shop_active_created_idx")
+  @@index([shopId, syncJobId, isActive, createdAtTs], map: "temu_product_list_caches_shop_sync_active_created_idx")
+  @@index([shopId, productName], map: "temu_product_list_caches_shop_name_idx")
+  @@index([shopId, productId], map: "temu_product_list_caches_shop_product_idx")
+  @@index([shopId, productSkcId], map: "temu_product_list_caches_shop_skc_idx")
+  @@index([shopId, leafCatId], map: "temu_product_list_caches_shop_leaf_cat_idx")
+  @@index([bindSiteIds], type: Gin, map: "temu_product_list_caches_bind_site_ids_gin_idx")
+  @@map("temu_product_list_caches")
+}
+
+model temuProductLifecycleStatusCache {
+  id                  String   @id @default(uuid())
+  shopId              String
+  productId           String
+  productSkcId        String
+  selectStatus        Int?
+  saleLifecycleStatus String?
+  skuIds              Json?
+  rawData             Json?
+  syncedAt            DateTime @default(now())
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([shopId, productSkcId])
+  @@index([shopId, saleLifecycleStatus, syncedAt], map: "temu_product_lifecycle_status_scope_status_synced_idx")
+  @@index([shopId, selectStatus], map: "temu_product_lifecycle_status_scope_select_idx")
+  @@map("temu_product_lifecycle_status_caches")
+}
+
+model temuProductListSyncJob {
+  id           String    @id @default(uuid())
+  userId       String
+  shopId       String
+  status       String
+  triggerType  String
+  totalCount   Int       @default(0)
+  syncedCount  Int       @default(0)
+  pageSize     Int       @default(100)
+  currentPage  Int       @default(0)
+  errorMessage String?   @db.Text
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([shopId, status, createdAt], map: "temu_product_list_sync_jobs_shop_status_created_idx")
+  @@index([userId, shopId, createdAt], map: "temu_product_list_sync_jobs_user_shop_created_idx")
+  @@map("temu_product_list_sync_jobs")
+}

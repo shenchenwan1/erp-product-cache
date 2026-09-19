@@ -1,0 +1,1 @@
+module.exports={testEnvironment:'node',testMatch:['<rootDir>/tests/*.spec.ts'],transform:{'^.+\\.tsx?$':['ts-jest',{tsconfig:'tsconfig.json'}]},setupFilesAfterEnv:['<rootDir>/tests/setup.ts'],testTimeout:30000};
